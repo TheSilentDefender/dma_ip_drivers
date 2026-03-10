@@ -116,18 +116,55 @@ static const struct pci_device_id pci_ids[] = {
 };
 MODULE_DEVICE_TABLE(pci, pci_ids);
 
-static void xpdev_free(struct xdma_pci_dev *xpdev)
+/*
+ * FIX: xpdev_release() is the kref release function.
+ *
+ * It is called by kref_put() exactly once, when the last reference to xpdev
+ * is dropped — whether that is remove_one() (normal removal with no open fds)
+ * or the last char_close() after a hot-disconnect.
+ *
+ * This is the ONLY place xdma_device_close() and kfree(xpdev) are called,
+ * which guarantees they never run while any fops handler holds a reference.
+ */
+void xpdev_release(struct kref *kref)
 {
+	struct xdma_pci_dev *xpdev =
+		container_of(kref, struct xdma_pci_dev, refcount);
 	struct xdma_dev *xdev = xpdev->xdev;
 
-	pr_info("xpdev 0x%p, destroy_interfaces, xdev 0x%p.\n", xpdev, xdev);
-	xpdev_destroy_interfaces(xpdev);
+	pr_info("xpdev 0x%p, last ref dropped, closing xdev 0x%p.\n",
+		xpdev, xdev);
+
 	xpdev->xdev = NULL;
-	pr_info("xpdev 0x%p, xdev 0x%p xdma_device_close.\n", xpdev, xdev);
 	xdma_device_close(xpdev->pdev, xdev);
 	xpdev_cnt--;
 
+	complete(&xpdev->ref_completion);
 	kfree(xpdev);
+}
+
+/*
+ * FIX: xpdev_free() no longer calls xdma_device_close() directly.
+ * Instead it:
+ *   1. Destroys the char device interfaces (marks them offline, removes
+ *      /dev nodes) so no new opens can succeed.
+ *   2. Drops the initial reference taken in xpdev_alloc().
+ *
+ * If no file descriptors are open, kref_put drops to zero immediately and
+ * xpdev_release() runs inline.  If fds are still open, xpdev_release() runs
+ * later when the last one calls char_close() — either way it is safe.
+ */
+static void xpdev_free(struct xdma_pci_dev *xpdev)
+{
+	pr_info("xpdev 0x%p, destroying interfaces.\n", xpdev);
+	xpdev_destroy_interfaces(xpdev);
+
+	pr_info("xpdev 0x%p, dropping initial ref.\n", xpdev);
+	kref_put(&xpdev->refcount, xpdev_release);
+	/*
+	 * Do NOT touch xpdev after this point — it may already be freed if
+	 * there were no open file descriptors.
+	 */
 }
 
 static struct xdma_pci_dev *xpdev_alloc(struct pci_dev *pdev)
@@ -143,6 +180,10 @@ static struct xdma_pci_dev *xpdev_alloc(struct pci_dev *pdev)
 	xpdev->user_max = MAX_USER_IRQ;
 	xpdev->h2c_channel_max = XDMA_CHANNEL_NUM_MAX;
 	xpdev->c2h_channel_max = XDMA_CHANNEL_NUM_MAX;
+
+	/* FIX: initialise kref to 1 (the reference held by the PCI driver) */
+	kref_init(&xpdev->refcount);
+	init_completion(&xpdev->ref_completion);
 
 	xpdev_cnt++;
 	return xpdev;
@@ -243,9 +284,15 @@ static void remove_one(struct pci_dev *pdev)
 
 	pr_info("pdev 0x%p, xdev 0x%p, 0x%p.\n",
 		pdev, xpdev, xpdev->xdev);
-	xpdev_free(xpdev);
 
 	dev_set_drvdata(&pdev->dev, NULL);
+
+	/*
+	 * FIX: clear drvdata before xpdev_free() so that if xpdev_release()
+	 * runs asynchronously (deferred via last char_close()) it cannot be
+	 * reached again through the pdev.
+	 */
+	xpdev_free(xpdev);
 }
 
 static pci_ers_result_t xdma_error_detected(struct pci_dev *pdev,

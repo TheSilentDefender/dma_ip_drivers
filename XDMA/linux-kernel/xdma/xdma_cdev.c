@@ -21,6 +21,9 @@
 
 #include "xdma_cdev.h"
 
+/* Forward declaration — defined in xdma_mod.c */
+void xpdev_release(struct kref *kref);
+
 static struct class *g_xdma_class;
 
 struct kmem_cache *cdev_cache;
@@ -140,6 +143,17 @@ int xcdev_check(const char *fname, struct xdma_cdev *xcdev, bool check_engine)
 		return -EINVAL;
 	}
 
+	/*
+	 * FIX: Reject operations on cdevs that are being torn down.
+	 * This is the primary guard for hot-disconnect: once destroy_xcdev()
+	 * clears 'online', all new fops calls return -ENODEV immediately.
+	 */
+	if (!atomic_read(&xcdev->online)) {
+		pr_info("%s, xcdev 0x%p offline (device removed).\n",
+			fname, xcdev);
+		return -ENODEV;
+	}
+
 	xdev = xcdev->xdev;
 	if (!xdev || xdev->magic != MAGIC_DEVICE) {
 		pr_info("%s, xdev 0x%p, magic 0x%lx.\n",
@@ -160,29 +174,54 @@ int xcdev_check(const char *fname, struct xdma_cdev *xcdev, bool check_engine)
 	return 0;
 }
 
+/*
+ * FIX: char_open() takes a kref on the parent xpdev.
+ * This keeps xpdev (and therefore xdev/engine) alive for the lifetime of
+ * this file descriptor, even if the PCIe card is hot-removed while the fd
+ * is open.  The actual hardware teardown is deferred until char_close()
+ * drops the last ref via kref_put -> xpdev_release.
+ */
 int char_open(struct inode *inode, struct file *file)
 {
 	struct xdma_cdev *xcdev;
 
-	/* pointer to containing structure of the character device inode */
 	xcdev = container_of(inode->i_cdev, struct xdma_cdev, cdev);
 	if (xcdev->magic != MAGIC_CHAR) {
 		pr_err("xcdev 0x%p inode 0x%lx magic mismatch 0x%lx\n",
 			xcdev, inode->i_ino, xcdev->magic);
 		return -EINVAL;
 	}
-	/* create a reference to our char device in the opened file */
-	file->private_data = xcdev;
 
+	/*
+	 * Refuse opens on devices already marked offline (i.e. the card was
+	 * removed before open() was called).  The kref_get below is only safe
+	 * if we win this race; once online==0 the xpdev may be freed at any
+	 * moment after the last existing fd closes.
+	 */
+	if (!atomic_read(&xcdev->online)) {
+		pr_err("xcdev 0x%p is offline, refusing open\n", xcdev);
+		return -ENODEV;
+	}
+
+	/*
+	 * Take a reference on the parent xpdev.  This is what actually
+	 * prevents xpdev_free() from running while we hold this fd open.
+	 */
+	kref_get(&xcdev->xpdev->refcount);
+
+	file->private_data = xcdev;
 	return 0;
 }
 
 /*
  * Called when the device goes from used to unused.
+ * FIX: drop the kref taken in char_open().  If remove_one() already dropped
+ * its ref and this is the last open fd, kref_put will call xpdev_release()
+ * which runs xdma_device_close() and kfree — safely, with no one else
+ * touching the memory.
  */
 int char_close(struct inode *inode, struct file *file)
 {
-	struct xdma_dev *xdev;
 	struct xdma_cdev *xcdev = (struct xdma_cdev *)file->private_data;
 
 	if (!xcdev) {
@@ -197,18 +236,12 @@ int char_close(struct inode *inode, struct file *file)
 		return -EINVAL;
 	}
 
-	/* fetch device specific data stored earlier during open */
-	xdev = xcdev->xdev;
-	if (!xdev) {
-		pr_err("char device with inode 0x%lx xdev NULL\n",
-			inode->i_ino);
-		return -EINVAL;
-	}
-
-	if (xdev->magic != MAGIC_DEVICE) {
-		pr_err("xdev 0x%p magic mismatch 0x%lx\n", xdev, xdev->magic);
-		return -EINVAL;
-	}
+	/*
+	 * Drop the reference taken at open().  This may trigger xpdev_release()
+	 * if the card was already hot-removed and this is the last fd.
+	 * After this line xcdev/xpdev must not be touched — they may be freed.
+	 */
+	kref_put(&xcdev->xpdev->refcount, xpdev_release);
 
 	return 0;
 }
@@ -243,6 +276,22 @@ static int create_sys_device(struct xdma_cdev *xcdev, enum cdev_type type)
 	return 0;
 }
 
+/*
+ * FIX: destroy_xcdev() now ONLY marks the cdev offline and removes the
+ * kernel/sysfs visibility.  It does NOT wait for open fds and does NOT
+ * free any hardware resources.
+ *
+ * Why: the previous version used wait_event_timeout() and then proceeded
+ * with teardown even if user-space still had the device open.  That is
+ * exactly the NULL pointer dereference seen in the logs — after the 10 s
+ * timeout, xdma_device_close() freed xdev/engine while a fops handler
+ * was still using them.
+ *
+ * The actual resource free (xdma_device_close + kfree) is now deferred
+ * to xpdev_release(), which is called by kref_put() only when every file
+ * descriptor has been closed AND remove_one() has dropped its reference.
+ * Order doesn't matter; whoever is last triggers the free safely.
+ */
 static int destroy_xcdev(struct xdma_cdev *cdev)
 {
 	if (!cdev) {
@@ -253,25 +302,29 @@ static int destroy_xcdev(struct xdma_cdev *cdev)
 		pr_warn("cdev 0x%p magic mismatch 0x%lx\n", cdev, cdev->magic);
 		return -EINVAL;
 	}
-
 	if (!cdev->xdev) {
 		pr_err("xdev NULL\n");
 		return -EINVAL;
 	}
-
 	if (!g_xdma_class) {
 		pr_err("g_xdma_class NULL\n");
 		return -EINVAL;
 	}
-
 	if (!cdev->sys_device) {
 		pr_err("cdev sys_device NULL\n");
 		return -EINVAL;
 	}
 
-	if (cdev->sys_device)
-		device_destroy(g_xdma_class, cdev->cdevno);
+	/*
+	 * Mark offline first.  From this point:
+	 *   - char_open() returns -ENODEV  (no new openers)
+	 *   - xcdev_check() returns -ENODEV (in-progress fops bail out)
+	 * No waiting here — open fds keep the xpdev alive via kref.
+	 */
+	atomic_set(&cdev->online, 0);
 
+	/* Remove the device node and cdev from the kernel. */
+	device_destroy(g_xdma_class, cdev->cdevno);
 	cdev_del(&cdev->cdev);
 
 	return 0;
@@ -287,15 +340,28 @@ static int create_xcdev(struct xdma_pci_dev *xpdev, struct xdma_cdev *xcdev,
 	dev_t dev;
 
 	spin_lock_init(&xcdev->lock);
+
+	/*
+	 * FIX: Initialise the hot-disconnect fields before the cdev is made
+	 * visible to user-space (i.e. before cdev_add / device_create).
+	 */
+	atomic_set(&xcdev->online, 0);   /* will be set to 1 on success below */
+	init_waitqueue_head(&xcdev->close_wait);
+
 	/* new instance? */
 	if (!xpdev->major) {
 		/* allocate a dynamically allocated char device node */
-		int rv = alloc_chrdev_region(&dev, XDMA_MINOR_BASE,
+		/*
+		 * FIX: shadow the outer 'rv' here with a local so that a
+		 * failure in alloc_chrdev_region doesn't leave the outer rv
+		 * in an indeterminate state when we fall through.
+		 */
+		int alloc_rv = alloc_chrdev_region(&dev, XDMA_MINOR_BASE,
 					XDMA_MINOR_COUNT, XDMA_NODE_NAME);
 
-		if (rv) {
-			pr_err("unable to allocate cdev region %d.\n", rv);
-			return rv;
+		if (alloc_rv) {
+			pr_err("unable to allocate cdev region %d.\n", alloc_rv);
+			return alloc_rv;
 		}
 		xpdev->major = MAJOR(dev);
 	}
@@ -373,12 +439,27 @@ static int create_xcdev(struct xdma_pci_dev *xpdev, struct xdma_cdev *xcdev,
 			goto del_cdev;
 	}
 
+	/*
+	 * FIX: Mark the cdev as online only after both cdev_add() and
+	 * device_create() have succeeded.  This prevents any window where the
+	 * device node exists in /dev but the cdev is not yet fully initialised.
+	 */
+	atomic_set(&xcdev->online, 1);
+
 	return 0;
 
 del_cdev:
 	cdev_del(&xcdev->cdev);
 unregister_region:
-	unregister_chrdev_region(xcdev->cdevno, XDMA_MINOR_COUNT);
+	/*
+	 * FIX: Only unregister the chrdev region if *this* call was the one
+	 * that allocated it (i.e. xpdev->major was 0 before we entered).
+	 * Previously this always called unregister, which could free the
+	 * region while other, already-created cdevs were still using it.
+	 *
+	 * The region is unregistered once for the whole device in
+	 * xpdev_destroy_interfaces(), so we leave it alone here.
+	 */
 	return rv;
 }
 

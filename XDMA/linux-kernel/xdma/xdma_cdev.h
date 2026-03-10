@@ -45,6 +45,7 @@ long char_ctrl_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
 
 void xpdev_destroy_interfaces(struct xdma_pci_dev *xpdev);
 int xpdev_create_interfaces(struct xdma_pci_dev *xpdev);
+void xpdev_release(struct kref *kref);   /* FIX: kref release callback */
 
 int bridge_mmap(struct file *file, struct vm_area_struct *vma);
 

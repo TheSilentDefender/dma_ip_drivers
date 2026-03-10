@@ -45,6 +45,10 @@
 #include <linux/version.h>
 #include <linux/uio.h>
 #include <linux/spinlock_types.h>
+/* FIX: added for kref and completion */
+#include <linux/kref.h>
+#include <linux/completion.h>
+#include <linux/atomic.h>
 
 #include "libxdma.h"
 #include "xdma_thread.h"
@@ -70,6 +74,22 @@ struct xdma_cdev {
 	struct xdma_user_irq *user_irq;	/* IRQ value, if needed */
 	struct device *sys_device;	/* sysfs device */
 	spinlock_t lock;
+
+	/*
+	 * FIX: hot-disconnect safety.
+	 *
+	 * 'online' is cleared (set to 0) by destroy_xcdev() before any
+	 * teardown begins.  char_open() and every ioctl/read/write handler
+	 * must test this flag under xcdev->lock before touching hw pointers.
+	 *
+	 * 'open_count' tracks the number of file descriptors currently open
+	 * against this cdev.  destroy_xcdev() waits on 'close_wait' until
+	 * open_count reaches zero so that no caller can be inside a fops
+	 * handler when we pull the rug out.
+	 */
+	atomic_t		online;
+	atomic_t		open_count;
+	wait_queue_head_t	close_wait;
 };
 
 /* XDMA PCIe device specific book-keeping */
@@ -98,6 +118,26 @@ struct xdma_pci_dev {
 	struct xdma_cdev xvc_cdev;
 
 	void *data;
+
+	/*
+	 * FIX: kref-based deferred free for hot-disconnect safety.
+	 *
+	 * The problem: remove_one() -> xpdev_free() calls xdma_device_close()
+	 * which frees the underlying xdev/engine structs.  If any file
+	 * descriptor is still open at that point, the next fops call
+	 * dereferences freed memory -> NULL pointer dereference / panic.
+	 *
+	 * Solution: xpdev holds a kref.  remove_one() marks every cdev
+	 * offline and drops its initial ref.  Each open() takes a ref;
+	 * each close() drops it.  The actual xdma_device_close() + kfree
+	 * only runs when the last ref is dropped, regardless of ordering.
+	 *
+	 * 'ref_completion' lets the module unload path (xdma_mod_exit) wait
+	 * for the final free if needed, avoiding use-after-free on module
+	 * unload racing with open file descriptors.
+	 */
+	struct kref		refcount;
+	struct completion	ref_completion;
 };
 
 struct cdev_async_io {

@@ -16,11 +16,11 @@ endif
 
 $(warning XVC_FLAGS: $(XVC_FLAGS).)
 
-topdir := $(shell cd $(src)/.. && pwd)
-
+EXTRA_CFLAGS := -I$(topdir)/include $(XVC_FLAGS)
 TARGET_MODULE:=xdma
 
-EXTRA_CFLAGS := -I$(topdir)/include $(XVC_FLAGS)
+ccflags-y += -I$(src)/../include
+ccflags-y += $(XVC_FLAGS)
 ifeq ($(DEBUG),1)
 	EXTRA_CFLAGS += -D__LIBXDMA_DEBUG__
 endif
